@@ -29,9 +29,10 @@ import threading
 import tkinter as tk
 import urllib.request
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 def get_app_dir():
@@ -702,12 +703,154 @@ def scan_network(network, progress_cb, local_ip=None, local_mac=None):
 
 
 # --------------------------------------------------------------------------
+# Minimal .xlsx writer (standard library only)
+# --------------------------------------------------------------------------
+NUMERIC_COLUMNS = {"Known MACs", "ID", "Hosts found"}
+_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_escape(text):
+    text = _ILLEGAL_XML.sub("", str(text))
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _col_letter(index):
+    letters, n = "", index + 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _sheet_xml(columns, rows):
+    widths = []
+    for i, col in enumerate(columns):
+        longest = max([len(str(col))] + [len(str(r[i])) for r in rows if i < len(r)])
+        widths.append(min(60, longest + 2))
+
+    out = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        f'<worksheet xmlns="{_NS_MAIN}">',
+        '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+        'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>',
+        "<cols>"
+        + "".join(
+            f'<col min="{i + 1}" max="{i + 1}" width="{w}" customWidth="1"/>'
+            for i, w in enumerate(widths)
+        )
+        + "</cols>",
+        "<sheetData>",
+    ]
+    header = "".join(
+        f'<c r="{_col_letter(i)}1" s="1" t="inlineStr"><is><t xml:space="preserve">'
+        f"{_xml_escape(c)}</t></is></c>"
+        for i, c in enumerate(columns)
+    )
+    out.append(f'<row r="1">{header}</row>')
+    for r_idx, row in enumerate(rows, start=2):
+        cells = []
+        for c_idx, value in enumerate(row):
+            text = str(value)
+            if text == "":
+                continue
+            ref = f"{_col_letter(c_idx)}{r_idx}"
+            if columns[c_idx] in NUMERIC_COLUMNS and text.isdigit():
+                cells.append(f'<c r="{ref}"><v>{text}</v></c>')
+            else:
+                cells.append(
+                    f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">'
+                    f"{_xml_escape(text)}</t></is></c>"
+                )
+        out.append(f'<row r="{r_idx}">{"".join(cells)}</row>')
+    out.append("</sheetData>")
+    last = f"{_col_letter(len(columns) - 1)}{len(rows) + 1}"
+    out.append(f'<autoFilter ref="A1:{last}"/>')
+    out.append("</worksheet>")
+    return "".join(out)
+
+
+def write_xlsx(path, sheets):
+    """sheets: list of (sheet_name, [column names], [row tuples])."""
+    names = []
+    for name, _cols, _rows in sheets:
+        clean = re.sub(r"[\[\]:*?/\\]", "-", name)[:31] or "Sheet"
+        names.append(clean)
+
+    n = len(sheets)
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + "".join(
+            f'<Override PartName="/xl/worksheets/sheet{i}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for i in range(1, n + 1)
+        )
+        + "</Types>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{_NS_REL}/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<workbook xmlns="{_NS_MAIN}" xmlns:r="{_NS_REL}"><sheets>'
+        + "".join(
+            f'<sheet name="{_xml_escape(nm)}" sheetId="{i}" r:id="rId{i}"/>'
+            for i, nm in enumerate(names, start=1)
+        )
+        + "</sheets></workbook>"
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(
+            f'<Relationship Id="rId{i}" Type="{_NS_REL}/worksheet" '
+            f'Target="worksheets/sheet{i}.xml"/>'
+            for i in range(1, n + 1)
+        )
+        + f'<Relationship Id="rId{n + 1}" Type="{_NS_REL}/styles" Target="styles.xml"/>'
+        "</Relationships>"
+    )
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<styleSheet xmlns="{_NS_MAIN}">'
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        "</styleSheet>"
+    )
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/styles.xml", styles)
+        for i, (_name, cols, rows) in enumerate(sheets, start=1):
+            zf.writestr(f"xl/worksheets/sheet{i}.xml", _sheet_xml(cols, rows))
+
+
+# --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Network IP / MAC Scanner")
+        self.title("Network IP / MAC Scanner V1.0 Development by Aboozar Farhadi")
         self.geometry("1050x600")
         self.db = Database(DB_PATH)
         self.q = queue.Queue()
@@ -750,6 +893,9 @@ class App(tk.Tk):
         self.oui_btn.pack(side="left")
         self.oui_var = tk.StringVar()
         ttk.Label(bottom, textvariable=self.oui_var).pack(side="left", padx=10)
+        ttk.Button(
+            bottom, text="Export all tabs to Excel", command=self.export_excel
+        ).pack(side="right")
 
     def _tree(self, parent, columns, widths):
         frame = ttk.Frame(parent)
@@ -761,6 +907,7 @@ class App(tk.Tk):
         tree.configure(yscrollcommand=sb.set)
         tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        self._attach_context_menu(tree)
         return frame, tree
 
     def _build_tabs(self):
@@ -889,6 +1036,97 @@ class App(tk.Tk):
         self.ip_var.set(ip)
         self.refresh_history()
         self.nb.select(1)
+
+    # ---- clipboard / context menu ----
+    def _attach_context_menu(self, tree):
+        columns = list(tree["columns"])
+        menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label="Copy record", command=lambda: self.copy_rows(tree))
+        copy_cols = [c for c in columns if c in ("IP", "MAC", "Hostname", "Vendor")]
+        if copy_cols:
+            menu.add_separator()
+        for col in copy_cols:
+            menu.add_command(
+                label=f"Copy {col}", command=lambda c=col: self.copy_cell(tree, c)
+            )
+
+        def popup(event):
+            iid = tree.identify_row(event.y)
+            if not iid:
+                return
+            if iid not in tree.selection():
+                tree.selection_set(iid)
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        tree.bind("<Button-3>", popup)
+        if platform.system() == "Darwin":
+            tree.bind("<Button-2>", popup)
+            tree.bind("<Control-Button-1>", popup)
+        tree.bind("<Control-c>", lambda e: self.copy_rows(tree))
+
+    def _selected_values(self, tree):
+        return [
+            tree.item(i, "values") for i in sorted(tree.selection(), key=tree.index)
+        ]
+
+    def _to_clipboard(self, text, message):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update_idletasks()
+        self.status_var.set(message)
+
+    def copy_rows(self, tree):
+        rows = self._selected_values(tree)
+        if not rows:
+            return
+        text = "\n".join("\t".join(str(v) for v in row) for row in rows)
+        self._to_clipboard(text, f"Copied {len(rows)} record(s) to clipboard")
+
+    def copy_cell(self, tree, column):
+        rows = self._selected_values(tree)
+        if not rows:
+            return
+        idx = list(tree["columns"]).index(column)
+        text = "\n".join(str(row[idx]) for row in rows)
+        self._to_clipboard(text, f"Copied {column} to clipboard")
+
+    # ---- Excel export ----
+    def export_excel(self):
+        default = f"network_scan_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Export to Excel",
+            defaultextension=".xlsx",
+            initialfile=default,
+            initialdir=os.path.dirname(DB_PATH),
+            filetypes=[("Excel workbook", "*.xlsx")],
+        )
+        if not path:
+            return
+        sheets = []
+        for name, tree in (
+            ("Latest scan", self.latest_tree),
+            ("IP-MAC history", self.hist_tree),
+            ("Scan log", self.scans_tree),
+        ):
+            cols = list(tree["columns"])
+            rows = [tree.item(i, "values") for i in tree.get_children()]
+            sheets.append((name, cols, rows))
+        try:
+            write_xlsx(path, sheets)
+        except OSError as exc:
+            messagebox.showerror(
+                "Export failed",
+                f"Could not write the file. Is it open in Excel?\n\n{exc}",
+            )
+            return
+        self.status_var.set(f"Exported: {path}")
+        if IS_WIN and messagebox.askyesno(
+            "Export", "Export finished. Open the file now?"
+        ):
+            os.startfile(path)  # noqa: S606
 
     # ---- vendor DB update ----
     def check_oui_on_start(self):
